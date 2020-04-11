@@ -1,0 +1,258 @@
+pipeline{
+    agent {
+        label params.agent
+    }
+    environment{
+        node = "${params.agent}"
+    }
+    stages {
+        stage('init') {
+            steps {
+                script {
+                    foldersToCleanup = getFolderPath(node, 'FolderPaths.properties')
+                    echo "List of folders to cleanup: ${foldersToCleanup}"
+                }
+            }
+        }
+        stage('Initial free disk space') {
+            steps {
+                echo 'Finding how much free space is on O/S drive'
+                script {
+                    initialFreeSpace = findFreeSpace()
+                    echo "Initial free space is ${initialFreeSpace} GB"
+                }
+            }
+        }
+        stage('Perform Cleanup') {
+            steps {
+                echo 'Moving and removing files'
+                script{
+                    removeFolders(foldersToCleanup, node)
+                }
+            }
+        }
+        stage('Final free disk space') {
+            steps {
+                echo 'Displaying new free space'
+                script {
+                    finalFreeSpace = findFreeSpace()
+                    echo "Free space is ${finalFreeSpace} GB"
+
+                    initialFreeSpace = ("$initialFreeSpace" as int)
+                    finalFreeSpace = ("$finalFreeSpace" as int)
+                    diskSize = findDiskSize()
+
+                    finalFreeSpaceInPercent = (finalFreeSpace / diskSize)
+                    echo "finalFreeSpaceInPercent: ${finalFreeSpaceInPercent}"
+                    diskSpaceGained = finalFreeSpace - initialFreeSpace
+                }
+            }
+        }
+        stage('Import data into an excel sheet') {
+            steps {
+                echo "Import data into an csv file in TempDataBackUp"
+                storeDataInCSV(node, initialFreeSpace, finalFreeSpace, diskSpaceGained)
+            }
+        }
+
+    }
+    post {
+        success {
+            echo "Node: ${node}"
+            echo "Free disk before cleanup: ${initialFreeSpace} GB"
+            echo "Free space after cleanup: ${finalFreeSpace} GB"
+            echo "How much free space has been gained: ${diskSpaceGained} GB"
+            echo "Disk size: ${diskSize} GB"
+            echo "List of folders that their contents has got removed: ${foldersToCleanup}"
+            script {
+                //if final free space is less than 10 percent of the Disk size email will be sent.
+                if (finalFreeSpaceInPercent < 0.1) {
+                    email()
+                }
+            }
+        }
+    }
+    parameters {
+        string(name: 'agent', defaultValue: 'none', description: 'Run on several servers')
+    }
+}
+
+// Remove line 95&96 after one time running
+void removeFolders(String paths, String node) {
+    echo 'Copying files...'
+    if (isUnix()) {
+        
+        //Finding a place to copy folders on MacOS machines
+        macOSRootPath =findingroot(node)
+
+        sh"""
+
+        #Creating directory by using time&date as name
+        folder_Paths=$paths
+        folder_Name=$macOSRootPath/\$(date +'%a-%m-%d-%y')
+
+        mkdir -p \$folder_Name
+
+        echo "starting action on node: $node"
+        
+        IFS=','
+        #folder_Paths is read into an array as tokens separated by IFS
+        read -ra folders <<< "\$folder_Paths"
+
+        for folderPath in "\${folders[@]}"; do
+            #echo "copying folder \$folderPath to \$folder_Name"
+
+            #Make a copy to another folder
+            cp -r \$folderPath \$folder_Name
+
+            echo '****'
+
+            echo "Deleting files & folders below:"
+            find \$folderPath -mindepth 1 -print -delete 
+
+            echo "=========================="
+        done
+
+        echo "Deleting Data Back folders that are older than 5"
+        find $macOSRootPath -mindepth 1 -maxdepth 1 -mtime +5 -print -exec rm -rf {} \\;
+        """
+        }
+    else {
+        bat """
+            @echo off
+            SETLOCAL ENABLEDELAYEDEXPANSION
+            set folder_Paths=${paths}
+            echo starting action on node: ${node}
+
+            Rem Creating directory by using time&date as name
+            set mydate=%date:/=%
+            set mytime=%time::=%
+            set mytime=%mytime:~0,-5%
+            set folderName=%mydate: =_%_%mytime%
+
+            for %%a in ("%folder_Paths:, =" "%") do (
+                set allFiles=%%a
+                set "subfolder=!allFiles:~1,-1!\\*"
+
+                Rem copying all subfolder/s and file/s from a specific path
+                xcopy /e /v /i /y %%a .\\%folderName%\\!allFiles:~3,-1!
+
+                echo ====================
+
+                Rem deleting all files on a specific path
+                del %%a\\* /s /f /q
+
+                Rem removing subdirectories
+                for /d %%x in (!subfolder!) do (
+                        echo Deleted subfolder - %%x
+                        @rd /s /q "%%x"
+                    )
+                echo ====================
+                )
+            pause
+        """
+        println 'Backup Files'
+        println '================================'
+        println 'Removing backup data which are older than 5 days'
+
+        //Removing backup data which are older than 5 days 
+        powershell'''
+            $age = (Get-Date).AddDays(-5)
+            Get-ChildItem .\\. -directory | foreach{
+                if ($_.LastWriteTime -le $age){
+                    Write-Output "Backup folder/s older than 5 days - $($_.name)"
+                    rmdir ".\\$($_.name)" -Recurse -Force
+                }
+            }
+        '''
+    }
+}
+
+//Finding Free Space on windows C drive or on mac  
+String findFreeSpace() {
+    def freeSpaceScript
+    if (isUnix()) {
+        //Find freespace and assigning it to freeSpaceScript
+        freeSpaceScript= '''
+                    disk=$(df -H | awk '/\\/dev\\/disk1s1/  {printf("%s", $4)}')
+                    #disk varaible has a string g as a unit at the end, attempt to remove it
+                    echo "${disk%G}"
+                '''
+    }
+    else {
+        //Find free space and assigning it to freeSpaceScript
+        freeSpaceScript = '''
+                    $disk = Get-WmiObject Win32_LogicalDisk -Filter "DeviceID='C:'" | Select-Object FreeSpace
+                    Write-output ("{0}" -f [math]::truncate($disk.FreeSpace / 1GB))
+                '''
+    }
+
+    return isUnix() ? sh(script: freeSpaceScript, returnStdout: true) : powershell(returnStdout: true, script: freeSpaceScript)
+}
+
+//Finding disk size on windows C drive or on mac 
+String findDiskSize() {
+    def sizeScript
+    if (isUnix()) {
+        //Find disk size and assigning it to sizeScript
+        sizeScript= '''
+                disk=$(df -H | awk '/\\/dev\\/disk1s1/  {printf("%s", $2)}')
+                echo "${disk%G}"
+            '''
+    }
+    else {
+        //Find disk size and assigning it to sizeScript
+        sizeScript = '''
+                $disk = Get-WmiObject Win32_LogicalDisk -Filter "DeviceID='C:'" | Select-Object Size
+                Write-output ("{0}" -f [math]::truncate($disk.Size / 1GB))
+            '''
+    }
+
+    return isUnix() ? sh(script: sizeScript, returnStdout: true) : powershell(script: sizeScript, returnStdout: true)
+}
+
+//Storing data from jenkins into csv file
+void storeDataInCSV(String node, int iFreeSpace, int fFreeSpace, int diff){
+    if (isUnix()) {
+        String csvFile =findingroot(node)
+        csvFile += "/data.csv"
+        sh"""
+            if [ -f "$csvFile" ]
+            then
+                echo "Storing data into $csvFile"
+            else
+                echo "Creating and storing data into $csvFile"
+                echo "date, FreeSpaceBeforeCleanUp, FreeSpaceAfterCleanUp, SpaceAdded" >> $csvFile
+            fi
+            findtime=\$(date +'%a %m-%d-%y %H:%M')
+            echo "\$findtime, $iFreeSpace GB, $fFreeSpace GB, $diff GB" >> $csvFile
+        """
+        }
+    else {
+        powershell"""
+        #check if data.csv exist
+        if(Test-Path .\\data.csv){
+            write-output "Storing data into data.csv file"
+        }else{
+            write-output "Creating and storing data into data.csv file"
+            \$dataheader = "Date, FreeSpaceBeforeCleanUp, FreeSpaceAfterCleanUp, SpaceAdded"
+            \$dataheader | add-content -path .\\data.csv
+        }
+        \$date = Get-Date -Format "dddd MM/dd/yyyy HH:mm"
+        \$data = "{0}, {1} GB, {2} GB, {3} GB" -f \$date, ${iFreeSpace},  ${fFreeSpace},  ${diff}
+
+        #add content to data.csv file
+        \$data | add-content -path .\\data.csv
+        """
+        }
+}
+
+void email() {
+    emailext (
+        subject: "Warning disk space is under 10% on node ${node}",
+        body: """Node: ${node}\nFree space before cleanup: ${initialFreeSpace} GB\nFree space after cleanup: ${finalFreeSpace} GB\nFree available space in percentage is ${finalFreeSpaceInPercent}%\nDisk Size: ${diskSize} GB\nList of folder(s) that has been removed : ${foldersToCleanup}
+        \nJob location: ${env.BUILD_URL} """,
+        to: "something",
+        from : "something"
+        )
+}

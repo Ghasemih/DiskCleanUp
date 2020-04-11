@@ -1,0 +1,34 @@
+pipeline{
+    agent {
+        label 'Server 1'
+    }
+    triggers {
+        cron('* * * * *')
+    }
+    stages {
+        stage('Disks Cleanup') {
+            parallel {
+                stage('Running on Server2') {
+                    when {
+                        expression { return Jenkins.instance.getNode('Server2').toComputer().isOnline() }
+                    }
+                    steps {
+                        build job: 'job',
+                              wait: true,
+                              parameters: [[$class: 'StringParameterValue', name: 'agent', value: 'Server2']]
+                    }
+                }
+                stage('Running on Server3') {
+                    when {
+                        expression { return Jenkins.instance.getNode('Server3').toComputer().isOnline() }
+                    }
+                    steps {
+                        build job: 'job',
+                              wait: true,
+                              parameters: [[$class: 'StringParameterValue', name: 'agent', value: 'Server3']]
+                    }
+                }
+            }
+        }
+    }
+}
